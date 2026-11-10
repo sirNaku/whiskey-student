@@ -1,0 +1,689 @@
+/* Whiskey Student, Phase 1 (personal use).
+   Everything is stored on this device in IndexedDB: entries, photos and field notes. */
+(() => {
+"use strict";
+const APP_VERSION = "1.1.0";
+const wideMQ = matchMedia("(min-width: 1000px)");
+const isWide = () => wideMQ.matches;
+
+/* ---------------- reference data ---------------- */
+const CATEGORIES = ["Bourbon","Rye","Tennessee Whiskey","Wheated Bourbon","American Single Malt","Single Malt Scotch","Blended Malt Scotch","Blended Scotch","Single Grain","Irish Single Pot Still","Irish Single Malt","Irish Blend","Japanese Whisky","Canadian Whisky","World Whisky","Other"];
+const COLORS = [["Pale Straw","#F2E2A0"],["Light Gold","#EAC96A"],["Gold","#DCAD44"],["Deep Gold","#CE9330"],["Amber","#BB7922"],["Deep Amber","#A4601A"],["Copper","#8D4B17"],["Russet","#733914"],["Mahogany","#592A10"],["Treacle","#3D1C0B"]];
+const AXES = [["sweet","Sweet"],["fruit","Fruit"],["floral","Floral"],["spice","Spice"],["oak","Oak"],["smoke","Smoke & Peat"],["grain","Grain"],["nutty","Nutty & Rich"]];
+const WHEEL = {
+  "Sweet":["vanilla","caramel","honey","brown sugar","maple","toffee","butterscotch","molasses","candy corn"],
+  "Fruit":["green apple","baked apple","pear","cherry","dark cherry","orange peel","lemon zest","banana","apricot","stone fruit","raisin","fig","dates","tropical fruit"],
+  "Floral & Herbal":["heather","rose","honeysuckle","fresh-cut grass","mint","eucalyptus","hay"],
+  "Spice":["cinnamon","clove","nutmeg","black pepper","rye spice","ginger","baking spice","anise","allspice"],
+  "Oak & Wood":["charred oak","toasted oak","cedar","sawdust","pencil shavings","tobacco leaf","leather","oak tannin"],
+  "Grain":["cornbread","malted barley","biscuit","bread dough","porridge","cereal","popcorn"],
+  "Smoke & Maritime":["peat smoke","campfire","ash","iodine","sea salt","brine","smoked meat","medicinal"],
+  "Nutty & Rich":["almond","hazelnut","walnut","marzipan","dark chocolate","milk chocolate","espresso","sherry","dried fruit cake"],
+  "Other":["ethanol heat","solvent","sulfur","mineral","earthy","mushroom","new make"]
+};
+const SENSES = [["nose","Nose","What you smell before sipping. Nose it at the rim, then deeper in the glass."],["palate","Palate","Flavor, sweetness, heat and texture on the tongue."],["finish","Finish","What lingers after you swallow, and how it changes."]];
+const NOTE_TYPES = ["Idea","Improvement","Bug","Feature","Observation"];
+const NOTE_AREAS = ["General","Journal list","The bottle","The distillery","The pour","Nose / palate / finish","Flavor profile","Verdict","Personal notes","Photos","Data & backup","Phase 2"];
+const MAX_PHOTOS = 6;
+
+/* ---------------- helpers ---------------- */
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const uid = p => (p || "t") + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const today = () => { const d = new Date(); return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0"); };
+const fmtDate = s => { if (!s) return ""; const [y,m,d] = s.slice(0,10).split("-").map(Number); return new Date(y, m-1, d).toLocaleDateString(undefined, {year:"numeric", month:"short", day:"numeric"}); };
+const fmtStamp = iso => { try { return new Date(iso).toLocaleString(undefined, {month:"short", day:"numeric", year:"numeric", hour:"numeric", minute:"2-digit"}); } catch { return iso; } };
+const colorHex = i => (i === "" || i == null) ? "transparent" : (COLORS[i] || [null,"transparent"])[1];
+const proofOf = abv => { const v = Number(abv); return v ? (v*2).toFixed(1).replace(/\.0$/, "") : ""; };
+const clone = o => JSON.parse(JSON.stringify(o));
+
+let toastTimer;
+function toast(msg, action){
+  const t = $("#toast"); clearTimeout(toastTimer);
+  t.innerHTML = `<span>${esc(msg)}</span>` + (action ? `<button type="button">${esc(action.label)}</button>` : "");
+  if (action) $("button", t).onclick = () => { t.hidden = true; action.run(); };
+  t.hidden = false; toastTimer = setTimeout(() => t.hidden = true, action ? 8000 : 3200);
+}
+
+/* ---------------- storage (IndexedDB) ---------------- */
+const DB_NAME = "whiskey-student", DB_VER = 1;
+let idb;
+function openDB(){
+  return new Promise((res, rej) => {
+    const r = indexedDB.open(DB_NAME, DB_VER);
+    r.onupgradeneeded = () => {
+      const d = r.result;
+      if (!d.objectStoreNames.contains("entries")) d.createObjectStore("entries", {keyPath:"id"});
+      if (!d.objectStoreNames.contains("photos")) d.createObjectStore("photos", {keyPath:"id"}).createIndex("entryId", "entryId");
+      if (!d.objectStoreNames.contains("notes")) d.createObjectStore("notes", {keyPath:"id"});
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+function store(name, mode = "readonly"){ return idb.transaction(name, mode).objectStore(name); }
+const req = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+const all = name => req(store(name).getAll());
+const put = (name, v) => req(store(name, "readwrite").put(v));
+const del = (name, k) => req(store(name, "readwrite").delete(k));
+const getOne = (name, k) => req(store(name).get(k));
+
+/* in-memory mirrors */
+let entries = [], notes = [];
+async function loadAll(){ entries = await all("entries"); notes = await all("notes"); }
+
+async function saveEntry(e){ e.updatedAt = new Date().toISOString(); if (!e.createdAt) e.createdAt = e.updatedAt; await put("entries", clone(e));
+  const i = entries.findIndex(x => x.id === e.id); if (i >= 0) entries[i] = clone(e); else entries.push(clone(e)); }
+async function deleteEntry(id){
+  const e = entries.find(x => x.id === id);
+  for (const pid of (e?.photos || [])) await del("photos", pid);
+  await del("entries", id); entries = entries.filter(x => x.id !== id);
+}
+async function saveNote(n){ n.updatedAt = new Date().toISOString(); await put("notes", clone(n));
+  const i = notes.findIndex(x => x.id === n.id); if (i >= 0) notes[i] = clone(n); else notes.push(clone(n)); }
+async function deleteNote(id){ await del("notes", id); notes = notes.filter(x => x.id !== id); }
+
+/* photo URLs, cached per session */
+const urlCache = new Map();
+async function photoURL(id){
+  if (urlCache.has(id)) return urlCache.get(id);
+  const p = await getOne("photos", id); if (!p) return null;
+  const u = URL.createObjectURL(p.blob); urlCache.set(id, u); return u;
+}
+
+/* resize a camera photo to a sensible size before storing */
+async function resizePhoto(file, max = 1600){
+  let src;
+  try { src = await createImageBitmap(file, {imageOrientation:"from-image"}); }
+  catch {
+    src = await new Promise((res, rej) => { const img = new Image(); img.onload = () => res(img); img.onerror = rej; img.src = URL.createObjectURL(file); });
+  }
+  const w = src.width, h = src.height, k = Math.min(1, max / Math.max(w, h));
+  const c = document.createElement("canvas"); c.width = Math.round(w*k); c.height = Math.round(h*k);
+  c.getContext("2d").drawImage(src, 0, 0, c.width, c.height);
+  return await new Promise(res => c.toBlob(b => res(b), "image/jpeg", 0.85));
+}
+
+/* ---------------- navigation ---------------- */
+let route = {name:"journal"};       // journal | entry | edit | notes | data
+let draft = null, dirty = false;
+const listState = {q:"", cat:"", sort:"date"};
+
+function go(next, {push = true} = {}){
+  if (route.name === "edit" && dirty && next.name !== "edit") {
+    toast("You have unsaved changes.", {label:"Discard", run:() => { dirty = false; draft = null; go(next, {push}); }});
+    return;
+  }
+  route = next;
+  if (push) history.pushState(next, "");
+  render(); window.scrollTo({top:0});
+}
+window.addEventListener("popstate", ev => {
+  const next = ev.state || {name:"journal"};
+  if (route.name === "edit" && dirty) { history.pushState(route, ""); toast("You have unsaved changes.", {label:"Discard", run:() => { dirty = false; draft = null; go(next, {push:false}); }}); return; }
+  route = next; render(); window.scrollTo({top:0});
+});
+$$(".tabs button").forEach(b => b.onclick = () => {
+  const t = b.dataset.tab;
+  if (t === "new") { if (route.name === "edit" && dirty) return toast("Save or cancel this entry first."); draft = blank(); dirty = false; go({name:"edit", id:draft.id, isNew:true}); }
+  else go({name:t});
+});
+
+function setHeader({eyebrow = "Tasting journal", title = null, back = false, actions = ""} = {}){
+  $("#eyebrow").textContent = eyebrow;
+  $("#title").innerHTML = title == null ? `Whiskey <span>Student</span>` : esc(title);
+  $("#backBtn").hidden = !back;
+  $("#topActions").innerHTML = actions;
+  const tab = route.name === "entry" ? "journal" : route.name === "edit" ? (route.isNew ? "new" : "journal") : route.name;
+  $$(".tabs button").forEach(b => b.dataset.tab === tab ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current"));
+}
+$("#backBtn").onclick = () => history.length > 1 ? history.back() : go({name:"journal"});
+
+function render(){
+  if (isWide() && entries.length && (route.name === "journal" || route.name === "entry")) return renderSplit();
+  $("#view").innerHTML = "";
+  if (route.name === "entry") return renderEntry();
+  if (route.name === "edit") return renderEditor();
+  if (route.name === "notes") return renderNotes();
+  if (route.name === "data") return renderData();
+  return renderJournal();
+}
+
+/* ---------------- iPad split view: list beside the open entry ---------------- */
+function renderSplit(){
+  if (route.name === "journal") {
+    const first = filtered()[0] || entries[0];
+    route = {name:"entry", id:first.id}; history.replaceState(route, "");
+  }
+  const keep = $("#listPane")?.scrollTop || 0;
+  $("#view").innerHTML = `<div class="split"><aside class="pane-list" id="listPane" aria-label="Your pours"></aside><section class="pane-detail" id="detailPane"></section></div>`;
+  renderJournal();
+  $("#listPane").scrollTop = keep;
+  renderEntry();
+}
+function selectEntry(id){
+  if (route.name === "entry" && route.id === id) return;
+  route = {name:"entry", id}; history.pushState(route, "");
+  $$("#list .item").forEach(b => b.setAttribute("aria-current", String(b.dataset.id === id)));
+  renderEntry(); $("#detailPane")?.scrollTo?.({top:0});
+}
+wideMQ.addEventListener("change", () => { if (route.name !== "edit") render(); });
+
+/* keyboard shortcuts for the Magic Keyboard */
+document.addEventListener("keydown", ev => {
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "");
+  if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "s" && route.name === "edit") { ev.preventDefault(); $("#ef")?.requestSubmit(); return; }
+  if (typing || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  if (ev.key === "n") { ev.preventDefault(); $('.tabs [data-tab="new"]').click(); }
+  else if (ev.key === "/") { if (route.name !== "journal" && route.name !== "entry") go({name:"journal"}); setTimeout(() => $("#q")?.focus(), 0); ev.preventDefault(); }
+  else if (ev.key === "e" && route.name === "entry") { $("#editBtn")?.click(); }
+  else if ((ev.key === "ArrowDown" || ev.key === "ArrowUp" || ev.key === "j" || ev.key === "k") && isWide() && route.name === "entry") {
+    const ids = filtered().map(e => e.id); const i = ids.indexOf(route.id);
+    const next = ids[i + ((ev.key === "ArrowDown" || ev.key === "j") ? 1 : -1)];
+    if (next) { ev.preventDefault(); selectEntry(next); $(`#list .item[data-id="${CSS.escape(next)}"]`)?.scrollIntoView({block:"nearest"}); }
+  }
+});
+
+/* ---------------- radar ---------------- */
+function radar(p){
+  const cx = 170, cy = 160, R = 105, n = AXES.length;
+  const pt = (i, r) => { const a = -Math.PI/2 + i*2*Math.PI/n; return [cx + Math.cos(a)*r, cy + Math.sin(a)*r]; };
+  let s = `<svg viewBox="-40 0 420 320" role="img" aria-label="Flavor profile: ${AXES.map(([k,l]) => l + " " + (Number(p?.[k])||0)).join(", ")}">`;
+  for (let k = 1; k <= 5; k++) s += `<polygon class="ring" points="${AXES.map((_,i) => pt(i, R*k/5).join(",")).join(" ")}"/>`;
+  AXES.forEach((_, i) => { const [x,y] = pt(i, R); s += `<line class="axis" x1="${cx}" y1="${cy}" x2="${x}" y2="${y}"/>`; });
+  const pts = AXES.map(([k], i) => pt(i, R*(Number(p?.[k])||0)/5));
+  s += `<polygon class="shape" points="${pts.map(q => q.join(",")).join(" ")}"/>`;
+  pts.forEach(q => s += `<circle class="pt" cx="${q[0]}" cy="${q[1]}" r="3"/>`);
+  AXES.forEach(([k,l], i) => { const [x,y] = pt(i, R+22); const a = Math.abs(x-cx) < 6 ? "middle" : x > cx ? "start" : "end";
+    s += `<text x="${x}" y="${y}" text-anchor="${a}" dominant-baseline="middle">${l} <tspan class="val">${Number(p?.[k])||0}</tspan></text>`; });
+  return s + `</svg>`;
+}
+
+/* ---------------- journal list ---------------- */
+function filtered(){
+  const q = listState.q.trim().toLowerCase();
+  const list = entries.filter(e => (!listState.cat || e.category === listState.cat) &&
+    (!q || [e.name,e.distillery,e.bottler,e.region,e.country,e.category,e.thoughts,e.cask,(e.nose||{}).text,(e.palate||{}).text,(e.finish||{}).text,...((e.nose||{}).tags||[]),...((e.palate||{}).tags||[]),...((e.finish||{}).tags||[])].join(" ").toLowerCase().includes(q)));
+  const by = listState.sort;
+  list.sort((a,b) => by === "score" ? (Number(b.score)||0) - (Number(a.score)||0) : by === "name" ? (a.name||"").localeCompare(b.name||"") : (b.date||"").localeCompare(a.date||"") || (b.updatedAt||"").localeCompare(a.updatedAt||""));
+  return list;
+}
+
+function renderJournal(){
+  setHeader();
+  const v = $("#listPane") || $("#view");
+  if (!entries.length) {
+    v.innerHTML = `<div class="empty"><h2>Your first pour is waiting</h2>
+      <p>Log the bottle, its distillery, the color, what you smell and taste, and your verdict. Add photos of the bottle and label as you go.</p>
+      <div class="btnrow" style="justify-content:center"><button class="btn primary" type="button" id="firstBtn">Start a tasting</button>
+      <button class="btn" type="button" id="importLink">Import a backup</button></div></div>`;
+    $("#firstBtn").onclick = () => { draft = blank(); dirty = false; go({name:"edit", id:draft.id, isNew:true}); };
+    $("#importLink").onclick = () => go({name:"data"});
+    return;
+  }
+  const dist = new Set(entries.map(e => (e.distillery||"").trim().toLowerCase()).filter(Boolean)).size;
+  v.innerHTML = `
+    <div class="summary"><span><b style="color:var(--ink)">${entries.length}</b> pour${entries.length>1?"s":""} · <b style="color:var(--ink)">${dist}</b> distiller${dist===1?"y":"ies"}</span></div>
+    <div class="tools">
+      <input class="field-s" id="q" type="search" placeholder="Search whiskey, distillery, flavors" aria-label="Search entries" value="${esc(listState.q)}">
+      <select class="field-s" id="cat" aria-label="Filter by category"><option value="">All</option>${CATEGORIES.map(c => `<option ${c===listState.cat?"selected":""}>${esc(c)}</option>`).join("")}</select>
+      <select class="field-s" id="sort" aria-label="Sort"><option value="date">Newest</option><option value="score" ${listState.sort==="score"?"selected":""}>Top score</option><option value="name" ${listState.sort==="name"?"selected":""}>A–Z</option></select>
+    </div>
+    <ul class="list" id="list"></ul>`;
+  $("#q").oninput = e => { listState.q = e.target.value; drawList(); };
+  $("#cat").onchange = e => { listState.cat = e.target.value; drawList(); };
+  $("#sort").onchange = e => { listState.sort = e.target.value; drawList(); };
+  drawList();
+}
+async function drawList(){
+  const ul = $("#list"); if (!ul) return;
+  const list = filtered();
+  if (!list.length) { ul.innerHTML = `<li style="padding:20px;color:var(--muted)">Nothing matches that search.</li>`; return; }
+  ul.innerHTML = list.map(e => `<li><button class="item" type="button" data-id="${esc(e.id)}" aria-current="${isWide() && route.name === "entry" && route.id === e.id}">
+    <span class="thumb" data-thumb="${esc((e.photos||[])[0]||"")}"><span class="glass" style="background:${colorHex(e.color)}"></span></span>
+    <span style="min-width:0"><div class="nm">${esc(e.name || "Untitled pour")}</div><div class="meta">${esc([e.distillery, fmtDate(e.date)].filter(Boolean).join(" · "))}</div></span>
+    <span class="sc">${esc(e.score ?? "")}</span></button></li>`).join("");
+  $$(".item", ul).forEach(b => b.onclick = () => isWide() ? selectEntry(b.dataset.id) : go({name:"entry", id:b.dataset.id}));
+  for (const t of $$("[data-thumb]", ul)) { const id = t.dataset.thumb; if (!id) continue; const u = await photoURL(id); if (u) t.innerHTML = `<img src="${u}" alt="">`; }
+}
+
+/* ---------------- entry view ---------------- */
+async function renderEntry(){
+  const e = entries.find(x => x.id === route.id);
+  if (!e) { route = {name:"journal"}; return render(); }
+  const split = !!$("#detailPane");
+  setHeader(split ? {actions:`<button class="btn small" type="button" id="editTop">Edit</button>`} : {eyebrow: e.category || "Whiskey", title: e.name || "Untitled pour", back:true,
+    actions:`<button class="btn small" type="button" id="editTop">Edit</button>`});
+  $("#editTop").onclick = () => { draft = clone(e); dirty = false; go({name:"edit", id:e.id}); };
+  const abv = Number(e.abv);
+  const fact = (k, v) => v ? `<div><div class="label">${k}</div><div class="v">${esc(v)}</div></div>` : "";
+  const sense = key => { const s = e[key] || {}; const lbl = SENSES.find(x => x[0] === key)[1];
+    const extra = key === "finish" && e.finishLength ? ` · ${esc(e.finishLength)}` : key === "palate" && e.mouthfeel ? ` · ${esc(e.mouthfeel)}` : "";
+    if (!s.text && !(s.tags||[]).length && !extra) return "";
+    return `<div class="sense"><div class="label">${lbl}${extra}</div>${s.text ? `<p>${esc(s.text)}</p>` : ""}<div class="chips">${(s.tags||[]).map(t => `<span class="chip">${esc(t)}</span>`).join("")}</div></div>`; };
+  const kv = rows => { const r = rows.filter(([,v]) => v); return r.length ? `<dl class="kv">${r.map(([k,v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("")}</dl>` : `<p class="muted" style="margin:0">Nothing recorded yet.</p>`; };
+  const hasProfile = AXES.some(([k]) => Number(e.profile?.[k]));
+
+  ($("#detailPane") || $("#view")).innerHTML = `<article class="page">
+    <div class="eh">
+      <div style="min-width:0"><h2>${esc(e.name || "Untitled pour")}</h2>
+        <div class="by">${esc([e.distillery, e.region, e.country].filter(Boolean).join(" · "))}</div></div>
+      ${e.score !== "" && e.score != null ? `<div class="score"><div class="n">${esc(e.score)}</div><div class="of">/ 100</div></div>` : ""}
+    </div>
+    ${(e.photos||[]).length ? `<div class="gallery" id="gallery"></div>` : ""}
+    <div class="facts">
+      ${fact("Tasted", fmtDate(e.date))}
+      ${fact("ABV / Proof", abv ? `${abv}% · ${proofOf(abv)}` : "")}
+      ${fact("Age", e.age)}${fact("Cask", e.cask)}${fact("Mash bill", e.mashbill)}${fact("Batch / Barrel", e.batch)}${fact("Price", e.price)}${fact("Bottler", e.bottler)}
+    </div>
+    <div class="cols"><div class="col">
+    <section class="sec" style="margin-top:0"><h3><span class="k">I</span>Tasting notes</h3>
+      ${e.color !== "" && e.color != null ? `<div class="sense"><div class="label">Appearance</div><div class="colorbar"><span class="sw" style="background:${colorHex(e.color)}"></span><div><b>${esc(COLORS[e.color][0])}</b><div class="muted" style="font-size:14px">${esc([e.legs ? "Legs: " + e.legs : "", e.appearance].filter(Boolean).join(" · "))}</div></div></div></div>` : ""}
+      ${sense("nose")}${sense("palate")}${sense("finish")}
+    </section></div><div class="col">
+    ${hasProfile ? `<section class="sec"><h3><span class="k">II</span>Flavor profile</h3><div class="radar">${radar(e.profile)}</div></section>` : ""}
+    <section class="sec"><h3><span class="k">III</span>Verdict</h3>${kv([["Score", e.score !== "" && e.score != null ? e.score + " / 100" : ""],["Buy again", e.buyAgain],["Value", e.value]])}</section></div></div>
+    <div class="cols"><div class="col">
+    <section class="sec"><h3><span class="k">IV</span>The distillery</h3>
+      ${kv([["Distillery",e.distillery],["Location",e.distLocation],["Founded",e.founded],["Master distiller",e.masterDistiller],["Stills",e.stills],["Water source",e.water],["Owner",e.owner]])}
+      ${e.distNotes ? `<p style="white-space:pre-wrap">${esc(e.distNotes)}</p>` : ""}</section>
+    </div><div class="col"><section class="sec"><h3><span class="k">V</span>The pour</h3>${kv([["Glassware",e.glass],["Served",e.serve],["Where",e.setting],["Source",e.source],["Bottle size",e.size]])}</section></div></div>
+    ${e.thoughts || e.learned || e.pairing ? `<section class="sec"><h3><span class="k">VI</span>Personal notes</h3>
+      ${e.thoughts ? `<div class="notesbox">${esc(e.thoughts)}</div>` : ""}
+      ${e.learned ? `<div class="sense"><div class="label">What I learned</div><p>${esc(e.learned)}</p></div>` : ""}
+      ${e.pairing ? `<div class="sense"><div class="label">Pairing</div><p>${esc(e.pairing)}</p></div>` : ""}</section>` : ""}
+    ${e.episode || e.contentNotes ? `<section class="sec"><h3><span class="k">VII</span>For the channel</h3>${kv([["Episode / post",e.episode],["Content notes",e.contentNotes]])}</section>` : ""}
+    <div class="foot" id="foot">
+      <button class="btn primary" type="button" id="editBtn">Edit entry</button>
+      <button class="btn" type="button" id="againBtn">Log another pour</button>
+      <button class="btn ghost danger" type="button" id="delBtn">Delete</button>
+    </div></article>`;
+
+  $("#editBtn").onclick = $("#editTop").onclick;
+  $("#againBtn").onclick = () => {
+    const c = clone(e);
+    Object.assign(c, {id:uid(), date:today(), createdAt:"", score:"", buyAgain:"", value:"", photos:[], nose:{text:"",tags:[]}, palate:{text:"",tags:[]}, finish:{text:"",tags:[]},
+      mouthfeel:"", finishLength:"", profile:Object.fromEntries(AXES.map(([k]) => [k,0])), thoughts:"", learned:"", episode:"", contentNotes:"", color:e.color});
+    draft = c; dirty = true; go({name:"edit", id:c.id, isNew:true});
+  };
+  $("#delBtn").onclick = () => {
+    $("#foot").innerHTML = `<div class="confirm">Delete this entry and its photos for good?
+      <button class="btn danger" type="button" id="delYes">Delete</button><button class="btn ghost" type="button" id="delNo">Keep</button></div>`;
+    $("#delNo").onclick = renderEntry;
+    $("#delYes").onclick = async () => { await deleteEntry(e.id); toast("Entry deleted."); route = {name:"journal"}; history.replaceState(route, ""); render(); };
+  };
+  if ((e.photos||[]).length) {
+    const g = $("#gallery");
+    for (const pid of e.photos) { const u = await photoURL(pid); if (u) { const img = document.createElement("img"); img.src = u; img.alt = "Photo of " + (e.name || "this whiskey"); img.onclick = () => lightbox(u); g.appendChild(img); } }
+  }
+}
+function lightbox(u){
+  const d = document.createElement("div"); d.className = "lightbox";
+  d.innerHTML = `<img src="${u}" alt=""><button class="iconbtn" type="button" aria-label="Close">✕</button>`;
+  d.onclick = () => d.remove(); document.body.appendChild(d);
+}
+
+/* ---------------- editor ---------------- */
+function blank(){
+  return { id:uid(), date:today(), name:"", category:"", distillery:"", country:"", region:"", bottler:"", mashbill:"", age:"", abv:"", cask:"", batch:"", price:"", size:"750 ml", source:"",
+    distLocation:"", founded:"", masterDistiller:"", stills:"", water:"", owner:"", distNotes:"",
+    glass:"Glencairn", serve:"Neat", setting:"", color:"", legs:"", appearance:"", photos:[],
+    nose:{text:"",tags:[]}, palate:{text:"",tags:[]}, finish:{text:"",tags:[]}, mouthfeel:"", finishLength:"",
+    profile:Object.fromEntries(AXES.map(([k]) => [k,0])), score:"", buyAgain:"", value:"", thoughts:"", learned:"", pairing:"", episode:"", contentNotes:"" };
+}
+/* fill in any fields missing from older or imported entries */
+function normalize(e){
+  const b = blank(); const out = Object.assign(b, e);
+  for (const k of ["nose","palate","finish"]) out[k] = Object.assign({text:"",tags:[]}, e[k] || {});
+  out.profile = Object.assign(b.profile, e.profile || {});
+  out.photos = Array.isArray(e.photos) ? e.photos : [];
+  return out;
+}
+
+async function renderEditor(){
+  if (!draft || draft.id !== route.id) { const e = entries.find(x => x.id === route.id); draft = e ? clone(e) : blank(); dirty = false; }
+  const E = draft; const isNew = !entries.find(x => x.id === E.id);
+  setHeader({eyebrow: isNew ? "New tasting" : "Editing", title: E.name || "Untitled pour", back:true});
+
+  const inp = (k, l, o = {}) => `<div class="f${o.wide?" wide":""}"><label for="f-${k}">${l}</label><input id="f-${k}" data-k="${k}" type="${o.type||"text"}" ${o.mode?`inputmode="${o.mode}"`:""} ${o.step?`step="${o.step}"`:""} placeholder="${esc(o.ph||"")}" value="${esc(E[k])}" autocomplete="off">${o.after||""}</div>`;
+  const ta = (k, l, ph) => `<div class="f wide"><label for="f-${k}">${l}</label><textarea id="f-${k}" data-k="${k}" placeholder="${esc(ph||"")}">${esc(E[k])}</textarea></div>`;
+  const sel = (k, l, opts) => `<div class="f"><label for="f-${k}">${l}</label><select id="f-${k}" data-k="${k}"><option value="">Choose…</option>${opts.map(o => `<option ${o===E[k]?"selected":""}>${esc(o)}</option>`).join("")}</select></div>`;
+  const seg = (k, l, opts) => `<div class="f wide"><span class="flabel">${l}</span><div class="seg" role="radiogroup" aria-label="${l}">${opts.map((o,i) => `<label><input type="radio" name="r-${k}" id="r-${k}-${i}" data-k="${k}" value="${esc(o)}" ${o===E[k]?"checked":""}>${esc(o)}</label>`).join("")}</div></div>`;
+  const STEPS = [["s1","Bottle"],["s2","Photos"],["s3","Distillery"],["s4","Pour"],["s5","Tasting"],["s6","Profile"],["s7","Verdict"],["s8","Notes"]];
+
+  $("#view").innerHTML = `
+    <div class="editor"><nav class="steps" aria-label="Sections">${STEPS.map(([id,l],i) => `<a href="#${id}"><span class="k">${i+1}</span>${l}</a>`).join("")}</nav>
+    <form id="ef" novalidate>
+      <section class="sec" id="s1"><h3><span class="k">1</span>The bottle</h3>
+        <div class="fg">
+          ${inp("name","Whiskey name",{wide:true,ph:"e.g. Redbreast 12 Year Old"})}
+          ${sel("category","Category",CATEGORIES)}
+          ${inp("date","Date tasted",{type:"date"})}
+          ${inp("country","Country",{ph:"Ireland"})}
+          ${inp("region","Region / State",{ph:"County Cork"})}
+          ${inp("age","Age statement",{ph:"12 years or NAS"})}
+          ${inp("abv","ABV %",{type:"number",step:"0.1",mode:"decimal",ph:"40",after:`<span class="derived" id="proofOut"></span>`})}
+          ${inp("bottler","Brand / Bottler",{ph:"Distillery or independent"})}
+          ${inp("mashbill","Mash bill / Grain",{wide:true,ph:"e.g. 75% corn, 13% rye, 12% malted barley"})}
+          ${inp("cask","Cask / Finish",{wide:true,ph:"New charred oak, ex-bourbon, oloroso sherry…"})}
+          ${inp("batch","Batch / Barrel no.")}
+          ${inp("price","Price paid",{ph:"$65"})}
+          ${inp("size","Bottle size",{ph:"750 ml"})}
+          ${sel("source","How you tasted it",["Own bottle","Bar pour","Sample","Distillery tour","Tasting event","Friend's bottle"])}
+        </div></section>
+
+      <section class="sec" id="s2"><h3><span class="k">2</span>Photos</h3>
+        <p class="hint">Front label, back label, the pour in the glass. The first photo is the cover. Up to ${MAX_PHOTOS}.</p>
+        <div class="photos-ed" id="photosEd"></div>
+        <div class="btnrow">
+          <label class="btn filebtn"><input type="file" accept="image/*" capture="environment" id="camIn">Take photo</label>
+          <label class="btn filebtn"><input type="file" accept="image/*" multiple id="libIn">Choose from library</label>
+        </div></section>
+
+      <section class="sec" id="s3"><h3><span class="k">3</span>The distillery</h3>
+        <p class="hint">Fill in what you know or research. Over time this becomes your study file on each producer.</p>
+        <div class="fg">
+          ${inp("distillery","Distillery",{ph:"Midleton Distillery"})}
+          ${inp("distLocation","Location",{ph:"Midleton, County Cork"})}
+          ${inp("founded","Founded")}
+          ${inp("masterDistiller","Master distiller / blender")}
+          ${sel("stills","Still type",["Pot still","Column still","Pot & column","Hybrid still","Unknown"])}
+          ${inp("water","Water source")}
+          ${inp("owner","Parent company")}
+          ${ta("distNotes","Distillery notes","History, production details, what sets their process apart, tour notes")}
+        </div></section>
+
+      <section class="sec" id="s4"><h3><span class="k">4</span>The pour</h3>
+        <div class="fg">
+          ${sel("glass","Glassware",["Glencairn","Copita / Nosing glass","NEAT glass","Tulip","Rocks glass","Snifter"])}
+          ${sel("serve","Served",["Neat","A few drops of water","Neat, then water","Large cube","On the rocks","In a cocktail"])}
+          ${inp("setting","Setting",{wide:true,ph:"Home bar, studio, distillery, on location"})}
+        </div>
+        <div class="f wide" style="margin-top:14px"><span class="flabel">Color: <b id="colorName" style="color:var(--ink)">${E.color !== "" && E.color != null ? esc(COLORS[E.color][0]) : "tap the closest match"}</b></span>
+          <div class="swatches" id="swatches">${COLORS.map(([n,h],i) => `<button type="button" data-i="${i}" aria-label="${n}" aria-pressed="${String(E.color)===String(i)}" style="background:${h}"></button>`).join("")}</div></div>
+        <div class="fg" style="margin-top:12px">${seg("legs","Legs / Viscosity",["Thin, fast","Medium","Thick, slow"])}${inp("appearance","Other appearance notes",{wide:true,ph:"Clarity, haze, sediment"})}</div>
+      </section>
+
+      <section class="sec" id="s5"><h3><span class="k">5</span>Nose, palate, finish</h3>
+        <p class="hint">Write it in your own words, then tap descriptors from the flavor wheel. Tags make entries searchable.</p>
+        ${SENSES.map(([k,l,h]) => `<div class="sense-ed" data-sense="${k}"><h4>${l}</h4><p class="hint" style="margin:0 0 8px">${h}</p>
+          <div class="sense-cols"><div><div class="f"><textarea id="s-${k}" data-sense-text="${k}" aria-label="${l} notes" placeholder="${l} notes">${esc(E[k].text)}</textarea></div>
+          ${k==="palate" ? `<div style="margin-top:10px">${seg("mouthfeel","Mouthfeel",["Thin","Light","Medium","Oily","Creamy","Chewy","Drying"])}</div>` : ""}
+          ${k==="finish" ? `<div style="margin-top:10px">${seg("finishLength","Finish length",["Short","Medium","Long","Very long"])}</div>` : ""}
+          <div class="picked chips" data-picked="${k}"></div></div>
+          <div class="wheel">${Object.entries(WHEEL).map(([g,ts]) => `<details><summary>${g}</summary><div class="chips">${ts.map(t => `<button type="button" class="chip" data-tag="${esc(t)}">${esc(t)}</button>`).join("")}</div></details>`).join("")}</div></div>
+        </div>`).join("")}
+      </section>
+
+      <section class="sec" id="s6"><h3><span class="k">6</span>Flavor profile</h3>
+        <p class="hint">Rate each family from 0 (absent) to 5 (dominant).</p>
+        <div class="profile"><div class="radar" id="liveRadar">${radar(E.profile)}</div>
+        <div class="sliders">${AXES.map(([k,l]) => `<div class="sl"><label for="p-${k}">${l}</label><input type="range" id="p-${k}" data-p="${k}" min="0" max="5" step="1" value="${Number(E.profile?.[k])||0}"><output id="o-${k}">${Number(E.profile?.[k])||0}</output></div>`).join("")}</div></div>
+      </section>
+
+      <section class="sec" id="s7"><h3><span class="k">7</span>Verdict</h3>
+        <div class="f wide"><label for="f-score">Score out of 100</label>
+          <div class="scorebox"><input type="range" id="f-score" min="50" max="100" step="1" value="${E.score || 80}"><span class="big" id="scoreOut">${E.score || "—"}</span></div>
+          <span class="derived">50–69 pass · 70–79 decent · 80–84 good · 85–89 very good · 90–94 outstanding · 95+ classic</span></div>
+        <div class="fg" style="margin-top:12px">${seg("buyAgain","Would you buy it again?",["Yes","Maybe","No"])}${seg("value","Value for the price",["Steal","Fair","Pricey","Overpriced"])}</div>
+      </section>
+
+      <section class="sec" id="s8"><h3><span class="k">8</span>Personal notes</h3>
+        <div class="fg">
+          ${ta("thoughts","Your thoughts","Overall impression, how it opened up with time or water, how it compares to others")}
+          ${ta("learned","What I learned","A new fact, technique or term this pour taught you")}
+          ${inp("pairing","Pairing",{wide:true,ph:"Food, cigar, or cocktail it would suit"})}
+          ${inp("episode","Episode / post",{wide:true,ph:"Video title, IG post, or link"})}
+          ${ta("contentNotes","Content notes","B-roll ideas, talking points, hook")}
+        </div></section>
+
+      <div class="formbar"><span class="msg" id="formMsg"></span>
+        <button class="btn ghost" type="button" id="cancelBtn">Cancel</button>
+        <button class="btn primary" type="submit" id="saveBtn">Save entry</button></div>
+    </form></div>`;
+
+  const f = $("#ef");
+  const mark = () => { dirty = true; };
+  const proof = () => { $("#proofOut").textContent = proofOf(E.abv) ? proofOf(E.abv) + " US proof" : ""; };
+  proof();
+  $$("[data-k]", f).forEach(el => el.addEventListener(el.type === "radio" ? "change" : "input", () => {
+    E[el.dataset.k] = el.value; mark();
+    if (el.dataset.k === "abv") proof();
+    if (el.dataset.k === "name") $("#title").textContent = el.value || "Untitled pour";
+  }));
+  $$(".steps a").forEach(a => a.onclick = ev => { ev.preventDefault(); $(a.getAttribute("href")).scrollIntoView({behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"}); });
+
+  /* photos */
+  const drawPhotos = async () => {
+    const box = $("#photosEd"); box.innerHTML = "";
+    for (const [i, pid] of E.photos.entries()) {
+      const u = await photoURL(pid); if (!u) continue;
+      const d = document.createElement("div"); d.className = "ph";
+      d.innerHTML = `<img src="${u}" alt="Photo ${i+1}">${i===0?'<span class="cover">Cover</span>':""}<button type="button" class="rm" aria-label="Remove photo ${i+1}">×</button>`;
+      $(".rm", d).onclick = () => { E.photos = E.photos.filter(x => x !== pid); mark(); drawPhotos(); };
+      if (i > 0) $("img", d).onclick = () => { E.photos = [pid, ...E.photos.filter(x => x !== pid)]; mark(); drawPhotos(); };
+      box.appendChild(d);
+    }
+    if (!E.photos.length) box.innerHTML = `<p class="muted" style="grid-column:1/-1;margin:0;font-size:14px">No photos yet.</p>`;
+    else if (E.photos.length > 1) box.insertAdjacentHTML("beforeend", `<p class="muted" style="grid-column:1/-1;margin:0;font-size:13px">Tap a photo to make it the cover.</p>`);
+  };
+  const addFiles = async files => {
+    const room = MAX_PHOTOS - E.photos.length;
+    if (room <= 0) return toast(`Up to ${MAX_PHOTOS} photos per entry.`);
+    $("#formMsg").textContent = "Adding photos…";
+    for (const file of [...files].slice(0, room)) {
+      try { const blob = await resizePhoto(file); const id = uid("p"); await put("photos", {id, entryId:E.id, blob, createdAt:new Date().toISOString()}); E.photos.push(id); mark(); }
+      catch { toast("One photo couldn't be read. Try a JPEG or PNG."); }
+    }
+    $("#formMsg").textContent = ""; drawPhotos();
+  };
+  $("#camIn").onchange = ev => { addFiles(ev.target.files); ev.target.value = ""; };
+  $("#libIn").onchange = ev => { addFiles(ev.target.files); ev.target.value = ""; };
+  drawPhotos();
+
+  /* color */
+  $$("#swatches button").forEach(b => b.onclick = () => {
+    E.color = Number(b.dataset.i); mark();
+    $$("#swatches button").forEach(x => x.setAttribute("aria-pressed", String(x === b)));
+    $("#colorName").textContent = COLORS[E.color][0];
+  });
+
+  /* senses */
+  const syncWheel = k => $$(`[data-sense="${k}"] [data-tag]`).forEach(c => c.setAttribute("aria-pressed", String(E[k].tags.includes(c.dataset.tag))));
+  const drawPicked = k => {
+    const box = $(`[data-picked="${k}"]`);
+    box.innerHTML = E[k].tags.length ? E[k].tags.map(t => `<button type="button" class="chip" data-un="${esc(t)}" aria-label="Remove ${esc(t)}">${esc(t)}</button>`).join("") : `<span class="muted" style="font-size:14px">No descriptors tagged yet.</span>`;
+    $$("[data-un]", box).forEach(c => c.onclick = () => { E[k].tags = E[k].tags.filter(t => t !== c.dataset.un); mark(); drawPicked(k); syncWheel(k); });
+  };
+  SENSES.forEach(([k]) => {
+    drawPicked(k); syncWheel(k);
+    $(`[data-sense-text="${k}"]`).addEventListener("input", ev => { E[k].text = ev.target.value; mark(); });
+    $$(`[data-sense="${k}"] [data-tag]`).forEach(c => c.onclick = () => {
+      const t = c.dataset.tag; E[k].tags = E[k].tags.includes(t) ? E[k].tags.filter(x => x !== t) : [...E[k].tags, t]; mark(); drawPicked(k); syncWheel(k);
+    });
+  });
+
+  /* profile & score */
+  $$("[data-p]", f).forEach(r => r.addEventListener("input", () => {
+    E.profile[r.dataset.p] = Number(r.value); $("#o-" + r.dataset.p).textContent = r.value; $("#liveRadar").innerHTML = radar(E.profile); mark();
+  }));
+  $("#f-score").addEventListener("input", ev => { E.score = Number(ev.target.value); $("#scoreOut").textContent = ev.target.value; mark(); });
+
+  $("#cancelBtn").onclick = () => { dirty = false; const to = isNew ? {name:"journal"} : {name:"entry", id:E.id}; draft = null; cleanupOrphans(); go(to); };
+  f.addEventListener("submit", async ev => {
+    ev.preventDefault();
+    if (!E.name.trim()) { $("#formMsg").textContent = "Add the whiskey's name to save."; $("#f-name").focus(); return; }
+    $("#saveBtn").disabled = true; $("#formMsg").textContent = "Saving…";
+    try {
+      await saveEntry(E); dirty = false; draft = null; await cleanupOrphans();
+      toast("Saved " + E.name + ".");
+      route = {name:"entry", id:E.id}; history.replaceState(route, ""); render(); window.scrollTo({top:0});
+    } catch (err) {
+      $("#saveBtn").disabled = false;
+      $("#formMsg").textContent = (err && err.name === "QuotaExceededError") ? "This device is out of storage for this app. Export a backup and remove old photos." : "Couldn't save. Try again.";
+    }
+  });
+}
+
+/* remove photos that no saved entry or open draft points to */
+async function cleanupOrphans(){
+  const keep = new Set(entries.flatMap(e => e.photos || []));
+  if (draft) (draft.photos || []).forEach(p => keep.add(p));
+  const ids = await req(store("photos").getAllKeys());
+  for (const id of ids) if (!keep.has(id)) { await del("photos", id); const u = urlCache.get(id); if (u) { URL.revokeObjectURL(u); urlCache.delete(id); } }
+}
+
+/* ---------------- field notes ---------------- */
+let noteFilter = "Open";
+function renderNotes(){
+  setHeader({eyebrow:"Phase 1 log", title:"Field notes"});
+  const v = $("#view");
+  v.innerHTML = `
+    <div class="notes-layout"><div class="nl-left">
+    <form class="composer" id="nf">
+      <label class="label" for="nText">What did you notice while using the journal?</label>
+      <textarea id="nText" placeholder="e.g. I want a quick-add for bar pours with fewer fields"></textarea>
+      <div class="row">
+        <select id="nType" aria-label="Type">${NOTE_TYPES.map(t => `<option>${t}</option>`).join("")}</select>
+        <select id="nArea" aria-label="Part of the app">${NOTE_AREAS.map(t => `<option>${t}</option>`).join("")}</select>
+      </div>
+      <button class="btn primary" type="submit">Add note</button>
+    </form></div><div class="nl-right">
+    <div class="filters" id="nFilters">${["Open","Done","All",...NOTE_TYPES].map(t => `<button type="button" data-f="${t}" aria-pressed="${t===noteFilter}">${t}</button>`).join("")}</div>
+    <ul class="notes" id="nList"></ul></div></div>`;
+  $("#nf").onsubmit = async ev => {
+    ev.preventDefault();
+    const text = $("#nText").value.trim(); if (!text) { $("#nText").focus(); return; }
+    await saveNote({id:uid("n"), createdAt:new Date().toISOString(), type:$("#nType").value, area:$("#nArea").value, text, status:"Open"});
+    $("#nText").value = ""; toast("Note added."); drawNotes();
+  };
+  $$("#nFilters button").forEach(b => b.onclick = () => { noteFilter = b.dataset.f; $$("#nFilters button").forEach(x => x.setAttribute("aria-pressed", String(x === b))); drawNotes(); });
+  drawNotes();
+}
+function drawNotes(){
+  const ul = $("#nList"); if (!ul) return;
+  const list = notes.filter(n => noteFilter === "All" ? true : noteFilter === "Open" || noteFilter === "Done" ? n.status === noteFilter : n.type === noteFilter)
+    .sort((a,b) => (b.createdAt||"").localeCompare(a.createdAt||""));
+  if (!list.length) { ul.innerHTML = `<li class="muted" style="padding:12px 2px">${notes.length ? "No notes in this view." : "No field notes yet. As you use the journal, jot down what works, what slows you down, and what you wish it did. These become the plan for Phase 2."}</li>`; return; }
+  ul.innerHTML = list.map(n => `<li class="note ${n.status==="Done"?"done":""}" data-id="${esc(n.id)}">
+    <div class="nh"><span class="pill t-${esc(n.type)}">${esc(n.type)}</span><span>${esc(n.area)}</span><span>·</span><span>${esc(fmtStamp(n.createdAt))}</span></div>
+    <p>${esc(n.text)}</p>
+    <div class="na"><button class="btn small ghost" type="button" data-act="toggle">${n.status==="Done"?"Reopen":"Mark done"}</button><button class="btn small ghost danger" type="button" data-act="del">Delete</button></div></li>`).join("");
+  $$(".note", ul).forEach(li => {
+    const n = notes.find(x => x.id === li.dataset.id);
+    $('[data-act="toggle"]', li).onclick = async () => { n.status = n.status === "Done" ? "Open" : "Done"; await saveNote(n); drawNotes(); };
+    $('[data-act="del"]', li).onclick = async () => { const keep = clone(n); await deleteNote(n.id); drawNotes(); toast("Note deleted.", {label:"Undo", run: async () => { await saveNote(keep); drawNotes(); }}); };
+  });
+}
+
+/* ---------------- data: backup, import, storage ---------------- */
+const blobToDataURL = b => new Promise(res => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(b); });
+const dataURLToBlob = async u => (await fetch(u)).blob();
+
+async function shareOrDownload(filename, blob){
+  const file = new File([blob], filename, {type: blob.type});
+  if (navigator.canShare && navigator.canShare({files:[file]})) {
+    try { await navigator.share({files:[file], title:filename}); return "shared"; } catch (e) { if (e && e.name === "AbortError") return "cancelled"; }
+  }
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = filename; document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+  return "downloaded";
+}
+
+async function exportBackup(withPhotos){
+  const photos = [];
+  if (withPhotos) for (const p of await all("photos")) photos.push({id:p.id, entryId:p.entryId, createdAt:p.createdAt, dataUrl: await blobToDataURL(p.blob)});
+  const payload = {app:"whiskey-student-journal", format:1, appVersion:APP_VERSION, exportedAt:new Date().toISOString(), entries, notes, photos};
+  const r = await shareOrDownload(`whiskey-student-backup-${today()}${withPhotos?"":"-no-photos"}.json`, new Blob([JSON.stringify(payload)], {type:"application/json"}));
+  if (r !== "cancelled") { localStorage.setItem("wsj-last-backup", new Date().toISOString()); toast("Backup ready."); renderData(); }
+}
+
+function notesMarkdown(){
+  const by = {};
+  notes.slice().sort((a,b) => (a.createdAt||"").localeCompare(b.createdAt||"")).forEach(n => (by[n.type] = by[n.type] || []).push(n));
+  let md = `# Whiskey Student — Phase 1 field notes\n\nExported ${fmtStamp(new Date().toISOString())} · ${notes.length} notes · ${entries.length} journal entries logged\n`;
+  for (const t of NOTE_TYPES) { if (!by[t]) continue; md += `\n## ${t}\n\n`; by[t].forEach(n => md += `- [${n.status === "Done" ? "x" : " "}] **${n.area}** (${fmtDate(n.createdAt)}): ${n.text.replace(/\n+/g, " ")}\n`); }
+  return md;
+}
+
+async function importFile(file){
+  let data;
+  try { data = JSON.parse(await file.text()); } catch { return toast("That file isn't a journal backup."); }
+  let inEntries = [], inNotes = [], inPhotos = [];
+  if (Array.isArray(data)) inEntries = data;                       // backup exported from the claude.ai journal
+  else if (data && Array.isArray(data.entries)) { inEntries = data.entries; inNotes = data.notes || []; inPhotos = data.photos || []; }
+  else return toast("That file isn't a journal backup.");
+  let added = 0, updated = 0, skipped = 0;
+  for (const p of inPhotos) { try { await put("photos", {id:p.id, entryId:p.entryId, createdAt:p.createdAt, blob: await dataURLToBlob(p.dataUrl)}); } catch {} }
+  for (const raw of inEntries) {
+    if (!raw || typeof raw !== "object" || !raw.id) { skipped++; continue; }
+    if (raw.example) { skipped++; continue; }
+    const cur = entries.find(e => e.id === raw.id);
+    if (cur && (cur.updatedAt||"") >= (raw.updatedAt||"")) { skipped++; continue; }
+    const e = normalize(raw); delete e.example;
+    await put("entries", e); cur ? updated++ : added++;
+  }
+  for (const n of inNotes) { if (n && n.id && !notes.find(x => x.id === n.id)) await put("notes", n); }
+  await loadAll();
+  toast(`Imported: ${added} new, ${updated} updated${skipped ? `, ${skipped} skipped` : ""}.`);
+  renderData();
+}
+
+async function renderData(){
+  setHeader({eyebrow:"Your data", title:"Backup & storage"});
+  const photoCount = (await req(store("photos").count()));
+  const last = localStorage.getItem("wsj-last-backup");
+  let usage = "";
+  try { const est = await navigator.storage?.estimate?.(); if (est) usage = `${(est.usage/1048576).toFixed(1)} MB used on this device`; } catch {}
+  let persisted = null; try { persisted = await navigator.storage?.persisted?.(); } catch {}
+  $("#view").innerHTML = `
+    <div class="stats"><div><div class="label">Entries</div><div class="v">${entries.length}</div></div><div><div class="label">Photos</div><div class="v">${photoCount}</div></div><div><div class="label">Notes</div><div class="v">${notes.length}</div></div></div>
+    <div class="cards"><div class="card"><h2>Back up your journal</h2>
+      <p>Everything lives on this device only. Save a backup to Files, iCloud Drive or Google Drive regularly. ${last ? `Last backup: <b style="color:var(--ink)">${esc(fmtStamp(last))}</b>.` : "<b style='color:var(--danger)'>No backup yet.</b>"}</p>
+      <div class="btnrow"><button class="btn primary" type="button" id="bkFull">Back up with photos</button><button class="btn" type="button" id="bkLite">Back up without photos</button></div></div>
+    <div class="card"><h2>Import</h2>
+      <p>Restore a backup from this app, or bring in entries from the claude.ai journal (use its <b>Export backup</b> button, then pick that file here). Entries already on this device are kept unless the import is newer.</p>
+      <label class="btn filebtn"><input type="file" accept="application/json,.json" id="impIn">Choose backup file</label></div>
+    <div class="card"><h2>Field notes for Phase 2</h2>
+      <p>Export your notes as a Markdown file, grouped by type, ready to share with Claude when you plan the next version.</p>
+      <div class="btnrow"><button class="btn" type="button" id="mdBtn">Export field notes</button><button class="btn ghost" type="button" id="mdCopy">Copy to clipboard</button></div></div>
+    <div class="card"><h2>Storage</h2>
+      <p>${esc(usage || "Storage details aren't available in this browser.")}${persisted === true ? " Protected from automatic clean-up." : persisted === false ? " The browser may clear it if the device runs low on space." : ""}</p>
+      ${persisted === false ? `<button class="btn" type="button" id="persistBtn">Protect my data</button>` : ""}
+      <p style="margin-top:12px;font-size:13px">Whiskey Student · Phase 1 · v${APP_VERSION}</p></div>
+    <div class="card kbd-card"><h2>Keyboard shortcuts</h2>
+      <dl class="kv"><dt><kbd>N</kbd></dt><dd>New pour</dd><dt><kbd>/</kbd></dt><dd>Search the journal</dd><dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>Previous / next entry</dd><dt><kbd>E</kbd></dt><dd>Edit the open entry</dd><dt><kbd>⌘</kbd> <kbd>S</kbd></dt><dd>Save entry</dd></dl></div></div>`;
+  $("#bkFull").onclick = () => exportBackup(true);
+  $("#bkLite").onclick = () => exportBackup(false);
+  $("#impIn").onchange = ev => { const f = ev.target.files[0]; ev.target.value = ""; if (f) importFile(f); };
+  $("#mdBtn").onclick = () => shareOrDownload(`whiskey-student-field-notes-${today()}.md`, new Blob([notesMarkdown()], {type:"text/markdown"}));
+  $("#mdCopy").onclick = async () => { try { await navigator.clipboard.writeText(notesMarkdown()); toast("Field notes copied."); } catch { toast("Copy isn't allowed here. Use Export instead."); } };
+  if ($("#persistBtn")) $("#persistBtn").onclick = async () => { const ok = await navigator.storage.persist(); toast(ok ? "Your data is now protected." : "The browser declined. Installing the app to your home screen usually helps."); renderData(); };
+}
+
+/* ---------------- boot ---------------- */
+(async () => {
+  try { idb = await openDB(); await loadAll(); }
+  catch { $("#view").innerHTML = `<div class="empty"><h2>Storage is unavailable</h2><p>This browser is blocking on-device storage, often because of private browsing. Open the app in a regular window.</p></div>`; return; }
+  try { if (navigator.storage?.persist && !(await navigator.storage.persisted())) navigator.storage.persist(); } catch {}
+  history.replaceState(route, "");
+  render();
+  const last = localStorage.getItem("wsj-last-backup");
+  if (entries.length >= 3 && (!last || Date.now() - Date.parse(last) > 14*864e5)) setTimeout(() => toast("It's been a while since your last backup.", {label:"Back up", run:() => go({name:"data"})}), 1200);
+})();
+
+if ("serviceWorker" in navigator && location.protocol !== "file:") {
+  navigator.serviceWorker.register("sw.js").then(reg => {
+    reg.addEventListener("updatefound", () => {
+      const nw = reg.installing;
+      nw && nw.addEventListener("statechange", () => {
+        if (nw.state === "installed" && navigator.serviceWorker.controller)
+          toast("A new version is ready.", {label:"Update", run:() => { nw.postMessage("skipWaiting"); }});
+      });
+    });
+  }).catch(() => {});
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => { if (!reloaded) { reloaded = true; location.reload(); } });
+}
+})();
