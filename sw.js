@@ -1,6 +1,6 @@
 /* Offline support. Bump CACHE when you change any app file so phones pick up the update. */
-const CACHE = "whiskey-student-v1.1.0";
-const SHELL = ["./", "index.html", "styles.css", "app.js", "manifest.webmanifest",
+const CACHE = "whiskey-student-v1.2.0";
+const SHELL = ["./", "index.html", "styles.css", "app.js", "seed.js", "manifest.webmanifest",
   "icons/icon-192.png", "icons/icon-512.png", "icons/icon-maskable-512.png", "icons/apple-touch-icon.png"];
 
 self.addEventListener("install", e => {
